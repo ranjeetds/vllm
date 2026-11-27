@@ -20,6 +20,8 @@ Key benefits:
 
 Level 1 sleep will offload the model weights and discard the KV cache. The content of KV cache is forgotten. Level 1 sleep is good for sleeping and waking up the engine to run the same model again. The model weights are backed up in CPU memory. Please make sure there's enough CPU memory to store the model weights. Level 2 sleep will discard the model parameters and the KV cache, and back up the rest of what the model allocated on the GPU while loading, like rope scaling tensors, in CPU memory. The content of the parameters and KV cache is forgotten. Level 2 sleep is good for sleeping and waking up the engine to update the model's weights, where the previous weights are not needed, e.g. RLHF weight update. Level 2 sleep is also useful when there is not enough CPU memory to back up the model weights, e.g. when a colocated trainer already uses CPU memory for offloading its own state; since the parameters are not backed up, restore them after waking up with `collective_rpc("reload_weights")`.
 
+With the extensible KV cache, warmup caps PyTorch's caching allocator for the whole process. Level 1 and level 2 sleep, and `release_kv_cache_memory()`, lift that cap after the cache's physical pages are released, so colocated code can allocate the freed memory. `wake_up()` or `wake_up(tags=["kv_cache"])` commits those pages again and restores the cap. Waking only the weights leaves the cap lifted, because the KV pages are still released. An engine that is not asleep keeps the cap.
+
 ### What level 2 keeps
 
 Level 2 discards only what is rebuilt on wake, which is what the weight update writes.
@@ -290,6 +292,27 @@ curl -X POST 'http://localhost:8000/wake_up?tags=kv_cache'
 
 !!! note
     These endpoints are only available when passing `VLLM_SERVER_DEV_MODE=1`.
+
+## Custom model loaders
+
+A custom `BaseModelLoader` can react to sleep and wake-up by overriding three optional methods. All keep today's behavior by default, so existing loaders are unaffected. For example, a loader that serves weights to other processes over RDMA directly from GPU memory must stop serving before that memory is freed.
+
+| Method | Called | Default |
+| --- | --- | --- |
+| `on_sleep(level)` | Before `Worker.sleep(level)` frees GPU memory. Pause anything that reads that memory. | No-op |
+| `on_wake_up(tags)` | After `Worker.wake_up(tags)` returns. | No-op |
+| `reload_model(vllm_config, model_config, model, *, is_checkpoint_format)` | From `reload_weights()`, when no weights are passed. | `get_all_weights()` + `model.load_weights()` |
+
+What the weights contain when `on_wake_up` runs for a wake-up that includes them (`tags` is `None` or contains `"weights"`) depends on the sleep level:
+
+| Sleep level | Weights in `on_wake_up` | When to resume |
+| --- | --- | --- |
+| 1 | Restored and valid | In `on_wake_up` |
+| 2 | Discarded; memory is re-allocated but empty | After `reload_model` completes |
+
+The hooks go to the loader instance that loaded the model, which records itself in `BaseModelLoader.load_model()`. A loader that overrides `load_model()` must call `bind_model_loader(model, self)` to receive them. When a loader overrides `reload_model`, `reload_weights()` reuses that same instance, so state kept across `on_sleep` and `on_wake_up` sees the reload. Loaders that keep the default get a fresh instance, as before.
+
+See the docstrings on `BaseModelLoader` for the exact contract.
 
 ## Limitation
 

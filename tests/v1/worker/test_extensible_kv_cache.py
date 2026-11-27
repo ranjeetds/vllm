@@ -54,7 +54,7 @@ def _make_config(layout: KVCacheLayout, num_blocks: int = NUM_BLOCKS):
     config = get_kv_cache_config_from_groups(
         vllm_config,
         [new_kv_cache_group(layers, spec)],
-        available_memory=NUM_LAYERS * spec.page_size_bytes * num_blocks,
+        num_blocks=num_blocks,
     )
     assert config.num_blocks == num_blocks
     return config, spec
@@ -452,6 +452,16 @@ def test_measured_sizing_counts_reclaimable_memory_on_integrated_gpu(monkeypatch
     assert measure() == 0
 
 
+def _bare_kv_cache() -> ExtensibleKVCache:
+    kv_cache = object.__new__(ExtensibleKVCache)
+    kv_cache.torch_memory_limit = None
+    kv_cache._torch_memory_limit_lifted = False
+    kv_cache._lifted_torch_memory_limit = None
+    kv_cache.buffer = SimpleNamespace(device=torch.device("cpu"), free=lambda: None)
+    kv_cache.num_committed_blocks = 0
+    return kv_cache
+
+
 def test_freeing_the_cache_lifts_the_torch_memory_cap(monkeypatch):
     """The process may start another engine, which must not inherit the cap."""
     fractions: list[float] = []
@@ -463,12 +473,51 @@ def test_freeing_the_cache_lifts_the_torch_memory_cap(monkeypatch):
         "set_per_process_memory_fraction",
         lambda fraction, device: fractions.append(fraction),
     )
-    kv_cache = object.__new__(ExtensibleKVCache)
-    kv_cache.buffer = SimpleNamespace(device=torch.device("cpu"), free=lambda: None)
+    kv_cache = _bare_kv_cache()
     kv_cache.num_committed_blocks = 2
     kv_cache.set_torch_memory_limit(25 << 30)
     kv_cache.free()
     assert fractions == [0.25, 1.0]
+    assert kv_cache.torch_memory_limit is None
+
+
+def test_sleep_lifts_and_wake_restores_the_torch_memory_cap(monkeypatch):
+    """The sizing cap is process-wide. Lifting it lets a colocated caller
+    allocate the freed memory; wake puts the same cap back. A second lift
+    keeps the original cap, and a wake that did not lift is a no-op."""
+    fractions: list[float] = []
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda *args: (0, 100 << 30)
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_per_process_memory_fraction",
+        lambda fraction, device: fractions.append(fraction),
+    )
+    kv_cache = _bare_kv_cache()
+    kv_cache.set_torch_memory_limit(25 << 30)
+    kv_cache.suspend_torch_memory_limit()
+    assert kv_cache.torch_memory_limit is None
+    kv_cache.suspend_torch_memory_limit()
+    kv_cache.resume_torch_memory_limit()
+    assert kv_cache.torch_memory_limit == 25 << 30
+    assert not kv_cache._torch_memory_limit_lifted
+    kv_cache.resume_torch_memory_limit()
+    assert fractions == [0.25, 1.0, 0.25]
+
+
+def test_lifting_an_unset_allocator_cap_is_a_no_op(monkeypatch):
+    """A cache that was never sized must not write a fraction on sleep."""
+    fractions: list[float] = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_per_process_memory_fraction",
+        lambda fraction, device: fractions.append(fraction),
+    )
+    kv_cache = _bare_kv_cache()
+    kv_cache.suspend_torch_memory_limit()
+    kv_cache.resume_torch_memory_limit()
+    assert fractions == []
     assert kv_cache.torch_memory_limit is None
 
 
@@ -488,7 +537,7 @@ def _make_mixed_config(num_blocks: int = NUM_BLOCKS):
     config = get_kv_cache_config_from_groups(
         vllm_config,
         [KVCacheGroup.from_layers({n: full_layer(s) for n, s in specs.items()})],
-        available_memory=sum(s.page_size_bytes for s in specs.values()) * num_blocks,
+        num_blocks=num_blocks,
     )
     assert config.num_blocks == num_blocks
     assert len({t.block_stride for t in config.kv_cache_tensors}) == 2
@@ -575,7 +624,7 @@ def test_block_outermost_views_have_mapped_memory_past_their_start(vmm, num_laye
     config = get_kv_cache_config_from_groups(
         vllm_config,
         [new_kv_cache_group(layers, spec)],
-        available_memory=num_layers * spec.page_size_bytes * NUM_BLOCKS,
+        num_blocks=NUM_BLOCKS,
     )
     kv_cache = ExtensibleKVCache(config, torch.device("cuda"), layout)
     try:
@@ -648,6 +697,49 @@ def test_release_and_recommit_for_sleep(vmm):
         kv_cache.recommit()
         assert kv_cache.physical_bytes >= kv_cache.size
         assert torch.count_nonzero(views[0]) == 0
+    finally:
+        kv_cache.free()
+
+
+@requires_cuda
+def test_allocator_cap_allows_allocation_only_while_released(vmm):
+    """A cap just above torch's reservation rejects a larger caching-allocator
+    allocation. Releasing the pages and lifting the cap lets that allocation
+    through; recommitting and restoring the cap rejects it again."""
+    config, _ = _make_config(KVCacheLayout.LBNHC)
+    device = torch.device("cuda")
+    kv_cache = ExtensibleKVCache(config, device, KVCacheLayout.LBNHC)
+    try:
+        allocate_kv_cache(
+            config, device, KVCacheLayout.LBNHC, allocate=kv_cache.allocate
+        )
+        kv_cache.commit(NUM_BLOCKS)
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        reserved = torch.accelerator.memory_reserved(device)
+        _free, total = torch.accelerator.get_memory_info(device)
+        slack = 8 << 20
+        limit = reserved + slack
+        assert limit < total, "caching allocator already reserves the device"
+        kv_cache.set_torch_memory_limit(limit)
+        alloc = slack + (32 << 20)
+
+        def allocate() -> torch.Tensor:
+            return torch.empty(alloc, dtype=torch.uint8, device=device)
+
+        with pytest.raises(torch.OutOfMemoryError):
+            allocate()
+        kv_cache.release_physical()
+        kv_cache.suspend_torch_memory_limit()
+        assert kv_cache.torch_memory_limit is None
+        buf = allocate()
+        del buf
+        torch.accelerator.empty_cache()
+        kv_cache.recommit()
+        kv_cache.resume_torch_memory_limit()
+        assert kv_cache.torch_memory_limit == limit
+        with pytest.raises(torch.OutOfMemoryError):
+            allocate()
     finally:
         kv_cache.free()
 
